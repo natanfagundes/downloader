@@ -1,13 +1,13 @@
-import httpx
-import re
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from subprocess import Popen, PIPE
+from fastapi.responses import FileResponse
+import yt_dlp
+import uuid
+import os
 
 app = FastAPI()
 
-# CORS liberado para o frontend
+# CORS liberado
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,52 +15,59 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def validate_url(url: str):
-    return re.match(r"^https?:\/\/", url) is not None
+# Pasta temporária para download
+DOWNLOAD_DIR = "/tmp/downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-async def download_stream(url: str):
-    async with httpx.AsyncClient() as client:
-        async with client.stream("GET", url) as r:
-            if r.status_code != 200:
-                raise HTTPException(status_code=400, detail="URL inacessível.")
-            async for chunk in r.aiter_bytes():
-                yield chunk
+@app.get("/")
+def home():
+    return {"status": "backend online"}
 
 @app.post("/api/download")
-async def download_file(data: dict):
+async def download(data: dict):
     url = data.get("url")
     fmt = data.get("format")
 
-    if not url or not validate_url(url):
+    if not url:
         raise HTTPException(status_code=400, detail="URL inválida.")
 
-    if fmt not in ("mp3", "mp4"):
+    file_id = str(uuid.uuid4())
+
+    if fmt == "mp3":
+        output = f"{DOWNLOAD_DIR}/{file_id}.mp3"
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": output,
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+        }
+
+    elif fmt == "mp4":
+        output = f"{DOWNLOAD_DIR}/{file_id}.mp4"
+        ydl_opts = {
+            "format": "bestvideo+bestaudio/best",
+            "outtmpl": output,
+            "merge_output_format": "mp4",
+        }
+
+    else:
         raise HTTPException(status_code=400, detail="Formato inválido.")
 
-    cmd = [
-        "ffmpeg",
-        "-i", "pipe:0",
-        "-f", fmt,
-        "-codec:a", "libmp3lame" if fmt == "mp3" else "aac",
-        "-codec:v", "copy" if fmt == "mp4" else "none",
-        "pipe:1",
-        "-y"
-    ]
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
 
-    process = Popen(cmd, stdin=PIPE, stdout=PIPE)
+        if not os.path.isfile(output):
+            raise HTTPException(status_code=500, detail="Erro ao gerar arquivo.")
 
-    async def ffmpeg_gen():
-        async for chunk in download_stream(url):
-            process.stdin.write(chunk)
-        process.stdin.close()
+        return FileResponse(
+            output,
+            filename=os.path.basename(output),
+            media_type="application/octet-stream"
+        )
 
-        while True:
-            out = process.stdout.read(1024)
-            if not out:
-                break
-            yield out
-
-    return StreamingResponse(
-        ffmpeg_gen(),
-        headers={"Content-Disposition": f'attachment; filename="download.{fmt}"'}
-    )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
